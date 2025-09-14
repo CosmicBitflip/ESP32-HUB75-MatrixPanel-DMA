@@ -60,11 +60,11 @@
 /* Do not change definitions below unless you pretty sure you know what you are doing! */
 
 // keeping a check sine it was possibe to set it previously
-#ifdef MATRIX_ROWS_IN_PARALLEL
-#pragma message "You are not supposed to set MATRIX_ROWS_IN_PARALLEL. Setting it back to default."
-#undef MATRIX_ROWS_IN_PARALLEL
-#endif
-#define MATRIX_ROWS_IN_PARALLEL 2
+// #ifdef matrix_rows_in_parallel
+// #pragma message "You are not supposed to set matrix_rows_in_parallel. Setting it back to default."
+// #undef matrix_rows_in_parallel
+// #endif
+// #define matrix_rows_in_parallel 2
 
 // 8bit per RGB color = 24 bit/per pixel,
 // can be extended to offer deeper colors, or
@@ -301,6 +301,8 @@ struct HUB75_I2S_CFG
   shift_driver driver;
   line_driver line_decoder;
 
+  bool single_scan = false; //single scan addition
+
   // use DMA double buffer (twice as much RAM required)
   bool double_buff;
 
@@ -346,8 +348,9 @@ struct HUB75_I2S_CFG
       uint8_t _latblk = DEFAULT_LAT_BLANKING, // Anything > 1 seems to cause artefacts on ICS panels
       bool _clockphase = true, 
       uint16_t _min_refresh_rate = 60, 
-      uint8_t _pixel_color_depth_bits = PIXEL_COLOR_DEPTH_BITS_DEFAULT) 
-      : mx_width(_w), mx_height(_h), chain_length(_chain), gpio(_pinmap), driver(_drv), double_buff(_dbuff), i2sspeed(_i2sspeed), latch_blanking(_latblk), clkphase(_clockphase), min_refresh_rate(_min_refresh_rate)
+      uint8_t _pixel_color_depth_bits = PIXEL_COLOR_DEPTH_BITS_DEFAULT,
+      bool _single_scan = false) //single scan addition
+      : mx_width(_w), mx_height(_h), chain_length(_chain), gpio(_pinmap), driver(_drv), double_buff(_dbuff), i2sspeed(_i2sspeed), latch_blanking(_latblk), clkphase(_clockphase), min_refresh_rate(_min_refresh_rate), single_scan(_single_scan)
   {
     setPixelColorDepthBits(_pixel_color_depth_bits);
   }
@@ -414,6 +417,12 @@ public:
       : Adafruit_GFX(MATRIX_WIDTH, MATRIX_HEIGHT)
 #endif
   {
+    HUB75_I2S_CFG default_cfg(MATRIX_WIDTH, MATRIX_HEIGHT, CHAIN_LENGTH);
+    setCfg(default_cfg);
+    rgb1_clear_mask = 0b1111111111111000;  // Default RGB1 mask
+    rgb2_clear_mask = 0b1111111111000111;  // Default RGB2 mask
+    rgb12_clear_mask = 0b1111111111000000; // Default RGB1+RGB2 mask
+    matrix_rows_in_parallel = 2;           // Default to dual-scan
   }
 
   /**
@@ -430,6 +439,10 @@ public:
 #endif
   {
     setCfg(opts);
+    rgb1_clear_mask = 0b1111111111111000;  // Default RGB1 mask
+    rgb2_clear_mask = 0b1111111111000111;  // Default RGB2 mask
+    rgb12_clear_mask = 0b1111111111000000; // Default RGB1+RGB2 mask
+    matrix_rows_in_parallel = 2;           // Default to dual-scan
   }
 
   /* Propagate the DMA pin configuration, allocate DMA buffs and start data output, initially blank */
@@ -480,6 +493,8 @@ public:
     {
       return false;
     } // couldn't even get the basic ram required.
+
+    initBitmasks(); // Initialize bitmasks based on single_scan
 	
     if (!initialized)
     {
@@ -708,8 +723,17 @@ public:
       return false;
 
     m_cfg = cfg;
-    PIXELS_PER_ROW = m_cfg.mx_width * m_cfg.chain_length;
-    ROWS_PER_FRAME = m_cfg.mx_height / MATRIX_ROWS_IN_PARALLEL;
+    if (m_cfg.single_scan) {
+      matrix_rows_in_parallel = 1;
+      if (m_cfg.mx_height == 32 && m_cfg.gpio.e == -1) {
+        ESP_LOGE("setCfg", "E pin required for single_scan on 32-height panel");
+        return false;
+      }
+      ROWS_PER_FRAME = m_cfg.mx_height; // 32 rows for 1/32 scan
+    } else {
+      matrix_rows_in_parallel = 2;
+      ROWS_PER_FRAME = m_cfg.mx_height / matrix_rows_in_parallel; // Default 16
+    }
     MASK_OFFSET = 16 - m_cfg.getPixelColorDepthBits();
 
     config_set = true;
@@ -900,18 +924,35 @@ private:
    * So now they could be changed, but shouldn't. Maybe put a cpp lock around it, so it can't be changed after initialisation
    */
   uint16_t PIXELS_PER_ROW = m_cfg.mx_width * m_cfg.chain_length;      // number of pixels in a single row of all chained matrix modules (WIDTH of a combined matrix chain)
-  uint8_t ROWS_PER_FRAME = m_cfg.mx_height / MATRIX_ROWS_IN_PARALLEL; // RPF - rows per frame, either 16 or 32 depending on matrix module
+  uint8_t ROWS_PER_FRAME = m_cfg.mx_height / matrix_rows_in_parallel; // RPF - rows per frame, either 16 or 32 depending on matrix module
   uint8_t MASK_OFFSET = 16 - m_cfg.getPixelColorDepthBits();
 
   // Other private variables
   bool initialized = false;
   bool config_set = false;
 
+  // runtime adjustable bitmasks for single scan support
+  uint16_t rgb1_clear_mask;
+  uint16_t rgb2_clear_mask;
+  uint16_t rgb12_clear_mask;
+  void initBitmasks();
+  uint8_t matrix_rows_in_parallel; // Replace matrix_rows_in_parallel macro
+
 }; // end Class header
 
 /***************************************************************************************/
 // https://stackoverflow.com/questions/5057021/why-are-c-inline-functions-in-the-header
 /* 2. functions declared in the header must be marked inline because otherwise, every translation unit which includes the header will contain a definition of the function, and the linker will complain about multiple definitions (a violation of the One Definition Rule). The inline keyword suppresses this, allowing multiple translation units to contain (identical) definitions. */
+
+inline void MatrixPanel_I2S_DMA::initBitmasks() {
+    if (m_cfg.single_scan) {
+        rgb2_clear_mask = 0xFFFF;    // Ignore RGB2
+        rgb12_clear_mask = rgb1_clear_mask; // Use only RGB1
+    } else {
+        rgb2_clear_mask = 0b1111111111000111;  // Restore default RGB2 mask
+        rgb12_clear_mask = 0b1111111111000000; // Restore default RGB1+RGB2 mask
+    }
+}
 
 /**
  * @brief - convert RGB565 to RGB888

@@ -69,6 +69,7 @@ enum PANEL_SCAN_TYPE {
 	FOUR_SCAN_40PX_HIGH,			///< Four-scan mode, 40-pixel high panels.	
 	FOUR_SCAN_40_80PX_HFARCAN,		///< Four-scan mode, 40-pixel high, 80px wide panel. Weird mapping: https://github.com/mrcodetastic/ESP32-HUB75-MatrixPanel-DMA/issues/759
 	FOUR_SCAN_64PX_HIGH,			///< Four-scan mode, 64-pixel high panels.
+	SINGLE_SCAN_32PX_HIGH			///< Single-scan mode, 32-pixel high panels with single RGB channel.
 };
 
 /**
@@ -162,6 +163,12 @@ struct ScanTypeMapping {
 			
 			coords.y = (coords.y >> 4) * 8 + (coords.y & 0b00000111);
 		}
+		// SINGLE_SCAN_32PX_HIGH
+        if constexpr (ScanType == SINGLE_SCAN_32PX_HIGH) {
+            // Direct mapping for 1/32 scan, single RGB, 32 rows addressed via A-E
+            coords.y = coords.y % 32; // Ensure y is 0-31
+            return coords;
+        }
 
 		// For STANDARD_TWO_SCAN / NORMAL_ONE_SIXTEEN no remapping is done.
 		return coords;
@@ -224,6 +231,17 @@ public:
 	{
 		// Initialize with an invalid coordinate.
 		coords.x = coords.y = -1;
+	}
+
+	// Validate single-scan mode at compile time
+	if constexpr (ScanTypeMapping::ScanType == SINGLE_SCAN_32PX_HIGH) {
+		if (_panel_res_y != 32) {
+			ESP_LOGE("VirtualMatrixPanel_T", "SINGLE_SCAN_32PX_HIGH requires panel height of 32");
+		}
+		const HUB75_I2S_CFG &cfg = display->getCfg(); // Assume display is set via setDisplay
+		if (!cfg.single_scan || cfg.gpio.e == -1) {
+			ESP_LOGE("VirtualMatrixPanel_T", "SINGLE_SCAN_32PX_HIGH requires single_scan=true and E pin");
+		}
 	}
 
 	// ------------------------------------------------------------------
@@ -300,7 +318,11 @@ public:
 				//int top_left_x = panel * panel_res_x;
 				this->drawRect(start_x, start_y, panel_res_x, panel_res_y, this->color565(0, 255, 0));
 				this->setCursor(start_x + panel_res_x/2 - 2, start_y + panel_res_y/2 - 4);
-				this->print(panel_id);
+				if constexpr (ScanTypeMapping::ScanType == SINGLE_SCAN_32PX_HIGH) {
+					this->print(panel_id); // Simpler numbering for single-scan
+				} else {
+					this->print(vmodule_cols * vmodule_rows - panel_id + 1); // Default numbering
+				}
 
 				//log_d("drawDisplayTest() Panel: %d, start_x: %d, start_y: %d", panel_id, start_x, start_y);
 			}

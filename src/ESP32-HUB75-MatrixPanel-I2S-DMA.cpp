@@ -43,6 +43,18 @@ bool MatrixPanel_I2S_DMA::setupDMA(const HUB75_I2S_CFG &_cfg)
   ESP_LOGI("I2S-DMA", "Free heap: %d", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
   ESP_LOGI("I2S-DMA", "Free SPIRAM: %d", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
+  if (m_cfg.single_scan) {
+      matrix_rows_in_parallel = 1;
+      if (m_cfg.mx_height == 32 && m_cfg.gpio.e == -1) {
+          ESP_LOGE("I2S-DMA", "E pin required for single_scan on 32-height panel");
+          return false;
+      }
+      ROWS_PER_FRAME = m_cfg.mx_height; // 32 rows for 1/32 scan
+  } else {
+      matrix_rows_in_parallel = 2;
+      ROWS_PER_FRAME = m_cfg.mx_height / matrix_rows_in_parallel; // Default 16
+  }
+
   size_t allocated_fb_memory = 0;
 
   int fbs_required = (m_cfg.double_buff) ? 2 : 1;
@@ -327,161 +339,134 @@ bool MatrixPanel_I2S_DMA::setupDMA(const HUB75_I2S_CFG &_cfg)
  */
 void IRAM_ATTR MatrixPanel_I2S_DMA::updateMatrixDMABuffer(uint16_t x_coord, uint16_t y_coord, uint8_t red, uint8_t green, uint8_t blue)
 {
-  if (!initialized)
-    return;
+    if (!initialized)
+        return;
 
-  /* 1) Check that the co-ordinates are within range, or it'll break everything big time.
-   * Valid co-ordinates are from 0 to (MATRIX_XXXX-1)
-   */
-  if (x_coord >= PIXELS_PER_ROW || y_coord >= m_cfg.mx_height)
-  {
-    return;
-  }
+    /* 1) Check that the co-ordinates are within range */
+    if (x_coord >= PIXELS_PER_ROW || y_coord >= m_cfg.mx_height)
+        return;
 
-  /* LED Brightness Compensation. Because if we do a basic "red & mask" for example,
-   * we'll NEVER send the dimmest possible colour, due to binary skew.
-   * i.e. It's almost impossible for colour_depth_idx of 0 to be sent out to the MATRIX unless the 'value' of a colour is exactly '1'
-   * https://ledshield.wordpress.com/2012/11/13/led-brightness-to-your-eye-gamma-correction-no/
-   */
-  uint16_t red16, green16, blue16;
+    /* LED Brightness Compensation */
+    uint16_t red16, green16, blue16;
 #ifdef NO_CIE1931
-  red16 	= red;
-  green16 	= green;
-  blue16 	= blue;
+    red16 = red;
+    green16 = green;
+    blue16 = blue;
 #else  
-  red16 = lumConvTab[red];
-  green16 = lumConvTab[green];
-  blue16 = lumConvTab[blue];
+    red16 = lumConvTab[red];
+    green16 = lumConvTab[green];
+    blue16 = lumConvTab[blue];
 #endif
 
-  /* When using the drawPixel, we are obviously only changing the value of one x,y position,
-   * however, the two-scan panels paint TWO lines at the same time
-   * and this reflects the parallel in-DMA-memory data structure of uint16_t's that are getting
-   * pumped out at high speed.
-   *
-   * So we need to ensure we persist the bits (8 of them) of the uint16_t for the row we aren't changing.
-   *
-   * The DMA buffer order has also been reversed (refer to the last code in this function)
-   * so we have to check for this and check the correct position of the MATRIX_DATA_STORAGE_TYPE
-   * data.
-   */
-  x_coord = ESP32_TX_FIFO_POSITION_ADJUST(x_coord);
+    x_coord = ESP32_TX_FIFO_POSITION_ADJUST(x_coord);
 
-  uint16_t _colourbitclear = BITMASK_RGB1_CLEAR, _colourbitoffset = 0;
+    uint16_t _colourbitclear = BITMASK_RGB1_CLEAR;
+    uint16_t _colourbitoffset = 0;
 
-  if (y_coord >= ROWS_PER_FRAME)
-  { // if we are drawing to the bottom part of the panel
-    _colourbitoffset = BITS_RGB2_OFFSET;
-    _colourbitclear = BITMASK_RGB2_CLEAR;
-    y_coord -= ROWS_PER_FRAME;
-  }
+    // For single_scan, use only RGB1 and full 0-31 row addressing
+    if (m_cfg.single_scan) {
+        _colourbitclear = BITMASK_RGB1_CLEAR; // Only clear RGB1
+        // Address 0-31 using A-E
+        uint16_t address_bits = 0;
+        if (y_coord & 0x01) address_bits |= BIT_A;
+        if (y_coord & 0x02) address_bits |= BIT_B;
+        if (y_coord & 0x04) address_bits |= BIT_C;
+        if (y_coord & 0x08) address_bits |= BIT_D;
+        if (y_coord & 0x10) address_bits |= BIT_E;
+        ESP32_I2S_DMA_STORAGE_TYPE *p = getRowDataPtr(y_coord, 0); // Direct row access
+        p[x_coord] &= _colourbitclear; // Clear RGB1
+    } else {
+        if (y_coord >= ROWS_PER_FRAME) {
+            _colourbitoffset = BITS_RGB2_OFFSET;
+            _colourbitclear = BITMASK_RGB2_CLEAR;
+            y_coord -= ROWS_PER_FRAME;
+        }
+    }
 
-  // Iterating through colour depth bits, which we assume are 8 bits per RGB subpixel (24bpp)
-  uint8_t colour_depth_idx = m_cfg.getPixelColorDepthBits();
-  do
-  {
-    --colour_depth_idx;
+    uint8_t colour_depth_idx = m_cfg.getPixelColorDepthBits();
+    do {
+        --colour_depth_idx;
 
 #ifdef NO_CIE1931
-    uint16_t mask = colour_depth_idx;
+        uint16_t mask = colour_depth_idx;
 #else	
-    uint16_t mask = PIXEL_COLOR_MASK_BIT(colour_depth_idx, MASK_OFFSET);
+        uint16_t mask = PIXEL_COLOR_MASK_BIT(colour_depth_idx, MASK_OFFSET);
 #endif	
-    uint16_t RGB_output_bits = 0;
+        uint16_t RGB_output_bits = 0;
 
-    /* Per the .h file, the order of the output RGB bits is:
-     * BIT_B2, BIT_G2, BIT_R2,    BIT_B1, BIT_G1, BIT_R1     */
-    RGB_output_bits |= (bool)(blue16 & mask); // --B
-    RGB_output_bits <<= 1;
-    RGB_output_bits |= (bool)(green16 & mask); // -BG
-    RGB_output_bits <<= 1;
-    RGB_output_bits |= (bool)(red16 & mask); // BGR
-    RGB_output_bits <<= _colourbitoffset;    // shift colour bits to the required position
+        RGB_output_bits |= (bool)(blue16 & mask);
+        RGB_output_bits <<= 1;
+        RGB_output_bits |= (bool)(green16 & mask);
+        RGB_output_bits <<= 1;
+        RGB_output_bits |= (bool)(red16 & mask);
+        RGB_output_bits <<= _colourbitoffset;
 
-    // Get the contents at this address,
-    // it would represent a vector pointing to the full row of pixels for the specified colour depth bit at Y coordinate
-    ESP32_I2S_DMA_STORAGE_TYPE *p = getRowDataPtr(y_coord, colour_depth_idx);
-
-    // We need to update the correct uint16_t word in the rowBitStruct array pointing to a specific pixel at X - coordinate
-    p[x_coord] &= _colourbitclear; // reset RGB bits
-    p[x_coord] |= RGB_output_bits; // set new RGB bits
-
-#if defined(SPIRAM_DMA_BUFFER)
-    Cache_WriteBack_Addr((uint32_t)&p[x_coord], sizeof(ESP32_I2S_DMA_STORAGE_TYPE));
-#endif
-
-  } while (colour_depth_idx); // end of colour depth loop (8)
-} // updateMatrixDMABuffer (specific co-ords change)
-
-
-/* Update the entire buffer with a single specific colour - quicker */
-void MatrixPanel_I2S_DMA::updateMatrixDMABuffer(uint8_t red, uint8_t green, uint8_t blue)
-{
-  if (!initialized)
-    return;
-
-  /* https://ledshield.wordpress.com/2012/11/13/led-brightness-to-your-eye-gamma-correction-no/ */
-  uint16_t red16, green16, blue16;
-#ifdef NO_CIE1931
-  red16 	= red;
-  green16 	= green;
-  blue16 	= blue;
-#else  
-  red16 = lumConvTab[red];
-  green16 = lumConvTab[green];
-  blue16 = lumConvTab[blue];
-#endif
-
-  for (uint8_t colour_depth_idx = 0; colour_depth_idx < m_cfg.getPixelColorDepthBits(); colour_depth_idx++) // colour depth - 8 iterations
-  {
-    // let's precalculate RGB1 and RGB2 bits than flood it over the entire DMA buffer
-    uint16_t RGB_output_bits = 0;
-
-#ifdef NO_CIE1931
-    uint16_t mask = colour_depth_idx;
-#else	
-    uint16_t mask = PIXEL_COLOR_MASK_BIT(colour_depth_idx, MASK_OFFSET);
-#endif	
-
-    /* Per the .h file, the order of the output RGB bits is:
-     * BIT_B2, BIT_G2, BIT_R2,    BIT_B1, BIT_G1, BIT_R1      */
-    RGB_output_bits |= (bool)(blue16 & mask); // --B
-    RGB_output_bits <<= 1;
-    RGB_output_bits |= (bool)(green16 & mask); // -BG
-    RGB_output_bits <<= 1;
-    RGB_output_bits |= (bool)(red16 & mask); // BGR
-
-    // Duplicate and shift across so we have have 6 populated bits of RGB1 and RGB2 pin values suitable for DMA buffer
-    RGB_output_bits |= RGB_output_bits << BITS_RGB2_OFFSET; // BGRBGR
-
-    // Serial.printf("Fill with: 0x%#06x\n", RGB_output_bits);
-
-    // iterate rows
-    int matrix_frame_parallel_row = fb->rowBits.size();
-    do
-    {
-      --matrix_frame_parallel_row;
-
-      // The destination for the pixel row bitstream
-      ESP32_I2S_DMA_STORAGE_TYPE *p = getRowDataPtr(matrix_frame_parallel_row, colour_depth_idx);
-
-      // iterate pixels in a row
-      int x_coord = fb->rowBits[matrix_frame_parallel_row]->width;
-      do
-      {
-        --x_coord;
-        p[x_coord] &= BITMASK_RGB12_CLEAR; // reset colour bits
-        p[x_coord] |= RGB_output_bits;     // set new colour bits
+        ESP32_I2S_DMA_STORAGE_TYPE *p = getRowDataPtr(y_coord, colour_depth_idx);
+        p[x_coord] &= _colourbitclear;
+        p[x_coord] |= RGB_output_bits;
 
 #if defined(SPIRAM_DMA_BUFFER)
         Cache_WriteBack_Addr((uint32_t)&p[x_coord], sizeof(ESP32_I2S_DMA_STORAGE_TYPE));
 #endif
 
-      } while (x_coord);
+    } while (colour_depth_idx);
+}
 
-    } while (matrix_frame_parallel_row); // end row iteration
-  }                                      // colour depth loop (8)
-} // updateMatrixDMABuffer (full frame paint)
+
+/* Update the entire buffer with a single specific colour - quicker */
+void MatrixPanel_I2S_DMA::updateMatrixDMABuffer(uint8_t red, uint8_t green, uint8_t blue)
+{
+    if (!initialized)
+        return;
+
+    uint16_t red16, green16, blue16;
+#ifdef NO_CIE1931
+    red16 = red;
+    green16 = green;
+    blue16 = blue;
+#else  
+    red16 = lumConvTab[red];
+    green16 = lumConvTab[green];
+    blue16 = lumConvTab[blue];
+#endif
+
+    for (uint8_t colour_depth_idx = 0; colour_depth_idx < m_cfg.getPixelColorDepthBits(); colour_depth_idx++) {
+        uint16_t RGB_output_bits = 0;
+
+#ifdef NO_CIE1931
+        uint16_t mask = colour_depth_idx;
+#else	
+        uint16_t mask = PIXEL_COLOR_MASK_BIT(colour_depth_idx, MASK_OFFSET);
+#endif	
+
+        RGB_output_bits |= (bool)(blue16 & mask);
+        RGB_output_bits <<= 1;
+        RGB_output_bits |= (bool)(green16 & mask);
+        RGB_output_bits <<= 1;
+        RGB_output_bits |= (bool)(red16 & mask);
+
+        if (m_cfg.single_scan) {
+            RGB_output_bits <<= 0; // Only RGB1, no shift
+        } else {
+            RGB_output_bits |= RGB_output_bits << BITS_RGB2_OFFSET; // Duplicate for RGB2
+        }
+
+        int matrix_frame_parallel_row = fb->rowBits.size();
+        do {
+            --matrix_frame_parallel_row;
+            ESP32_I2S_DMA_STORAGE_TYPE *p = getRowDataPtr(matrix_frame_parallel_row, colour_depth_idx);
+            int x_coord = fb->rowBits[matrix_frame_parallel_row]->width;
+            do {
+                --x_coord;
+                p[x_coord] &= BITMASK_RGB12_CLEAR;
+                p[x_coord] |= RGB_output_bits;
+#if defined(SPIRAM_DMA_BUFFER)
+                Cache_WriteBack_Addr((uint32_t)&p[x_coord], sizeof(ESP32_I2S_DMA_STORAGE_TYPE));
+#endif
+            } while (x_coord);
+        } while (matrix_frame_parallel_row);
+    }
+}
 
 /**
  * @brief - clears and reinitializes colour/control data in DMA buffs
@@ -504,32 +489,44 @@ void MatrixPanel_I2S_DMA::clearFrameBuffer(bool _buff_id)
   {
     --row_idx;
 
+    int x_pixel;
     ESP32_I2S_DMA_STORAGE_TYPE *row = fb->rowBits[row_idx]->getDataPtr(0); // set pointer to the HEAD of a buffer holding data for the entire matrix row
     ESP32_I2S_DMA_STORAGE_TYPE abcde = (ESP32_I2S_DMA_STORAGE_TYPE)row_idx;
 
     // get last pixel index in a row of all colourdepths
-    int x_pixel = fb->rowBits[row_idx]->width * fb->rowBits[row_idx]->colour_depth;
+    // int x_pixel = fb->rowBits[row_idx]->width * fb->rowBits[row_idx]->colour_depth;
 
-	abcde <<= BITS_ADDR_OFFSET; // shift row y-coord to match ABCDE bits in vector from 8 to 12
-	do
-	{
-		--x_pixel;
-		if (m_cfg.line_decoder == HUB75_I2S_CFG::SM5266P)
-		{
-			// modifications here for row shift register type SM5266P
-			// https://github.com/mrfaptastic/ESP32-HUB75-MatrixPanel-I2S-DMA/issues/164
-			row[x_pixel] = abcde & (0x18 << BITS_ADDR_OFFSET); // mask out the bottom 3 bits which are the clk di bk inputs
-		}
-		else if (m_cfg.line_decoder  == HUB75_I2S_CFG::SM5368) 
-		{
-			row[ESP32_TX_FIFO_POSITION_ADJUST(x_pixel)] = 0x0000;
-		}
-		else
-		{
-			row[ESP32_TX_FIFO_POSITION_ADJUST(x_pixel)] = abcde;
-		}
+	// abcde <<= BITS_ADDR_OFFSET; // shift row y-coord to match ABCDE bits in vector from 8 to 12
+  if (m_cfg.single_scan) {
+    abcde <<= BITS_ADDR_OFFSET; // Shift A-E bits for 0-31 addressing
+    x_pixel = fb->rowBits[row_idx]->width * fb->rowBits[row_idx]->colour_depth;
+    do {
+      --x_pixel;
+      row[ESP32_TX_FIFO_POSITION_ADJUST(x_pixel)] = abcde;
+    } while (x_pixel != fb->rowBits[row_idx]->width);
+  } else {
+    abcde <<= BITS_ADDR_OFFSET;
+    x_pixel = fb->rowBits[row_idx]->width * fb->rowBits[row_idx]->colour_depth;
+    do
+    {
+      --x_pixel;
+      if (m_cfg.line_decoder == HUB75_I2S_CFG::SM5266P)
+      {
+        // modifications here for row shift register type SM5266P
+        // https://github.com/mrfaptastic/ESP32-HUB75-MatrixPanel-I2S-DMA/issues/164
+        row[x_pixel] = abcde & (0x18 << BITS_ADDR_OFFSET); // mask out the bottom 3 bits which are the clk di bk inputs
+      }
+      else if (m_cfg.line_decoder  == HUB75_I2S_CFG::SM5368) 
+      {
+        row[ESP32_TX_FIFO_POSITION_ADJUST(x_pixel)] = 0x0000;
+      }
+      else
+      {
+        row[ESP32_TX_FIFO_POSITION_ADJUST(x_pixel)] = abcde;
+      }
 
-	} while (x_pixel != fb->rowBits[row_idx]->width); // spare the first "width's" worth of pixels as they are the LSB pixels/colordepth
+    } while (x_pixel != fb->rowBits[row_idx]->width); // spare the first "width's" worth of pixels as they are the LSB pixels/colordepth
+  }
 
 	// The colour_index[0] (LSB) x_pixels must be "marked" with a previous's row address, because it is used to display
 	// previous row while we pump in MSBs's for the next row.
@@ -632,68 +629,47 @@ void MatrixPanel_I2S_DMA::clearFrameBuffer(bool _buff_id)
 
 void MatrixPanel_I2S_DMA::setBrightnessOE(uint8_t brt, const int _buff_id)
 {
+    if (!initialized)
+        return;
 
-  if (!initialized)
-    return;
+    frameStruct *fb = &frame_buffer[_buff_id];
 
-  frameStruct *fb = &frame_buffer[_buff_id];
+    uint8_t _blank = m_cfg.latch_blanking;
+    uint8_t _depth = fb->rowBits[0]->colour_depth;
+    uint16_t _width = fb->rowBits[0]->width;
 
-  uint8_t _blank = m_cfg.latch_blanking; // don't want to inadvertantly blast over this
-  uint8_t _depth = fb->rowBits[0]->colour_depth;
-  uint16_t _width = fb->rowBits[0]->width;
+    int row_idx = fb->rowBits.size();
+    do {
+        --row_idx;
 
-  // start with iterating all rows in dma_buff structure
-  int row_idx = fb->rowBits.size();
-  do
-  {
-    --row_idx;
+        uint8_t colouridx = _depth;
+        do {
+            --colouridx;
+            char bitplane = (2 * _depth - colouridx) % _depth;
+            char bitshift = (_depth - lsbMsbTransitionBit - 1) >> 1;
+            char rightshift = std::max(bitplane - bitshift - 2, 0);
+            int brightness_in_x_pixels = ((_width - _blank) * brt) >> (7 + rightshift);
+            brightness_in_x_pixels = (brightness_in_x_pixels >> 1) | (brightness_in_x_pixels & 1);
 
-    // let's set OE control bits for specific pixels in each color_index subrows
-    uint8_t colouridx = _depth;
-    do
-    {
-      --colouridx;
-
-      char bitplane = (2 * _depth - colouridx) % _depth;
-      char bitshift = (_depth - lsbMsbTransitionBit - 1) >> 1;
-
-      char rightshift = std::max(bitplane - bitshift - 2, 0);
-      // calculate the OE disable period by brightness, and also blanking
-      int brightness_in_x_pixels = ((_width - _blank) * brt) >> (7 + rightshift);
-      brightness_in_x_pixels = (brightness_in_x_pixels >> 1) | (brightness_in_x_pixels & 1);
-
-      // switch pointer to a row for a specific color index
-      ESP32_I2S_DMA_STORAGE_TYPE *row = fb->rowBits[row_idx]->getDataPtr(colouridx);
-
-      // define range of Output Enable on the center of the row
-      int x_coord_max = (_width + brightness_in_x_pixels + 1) >> 1;
-      int x_coord_min = (_width - brightness_in_x_pixels + 0) >> 1;
-      int x_coord = _width;
-      do
-      {
-        --x_coord;
-
-        // (the check is already including "blanking" )
-        if (x_coord >= x_coord_min && x_coord < x_coord_max)
-        {
-          row[ESP32_TX_FIFO_POSITION_ADJUST(x_coord)] &= BITMASK_OE_CLEAR;
-        }
-        else
-        {
-          row[ESP32_TX_FIFO_POSITION_ADJUST(x_coord)] |= BIT_OE; // Disable output after this point.
-        }
-
-      } while (x_coord);
-
-    } while (colouridx);
+            ESP32_I2S_DMA_STORAGE_TYPE *row = fb->rowBits[row_idx]->getDataPtr(colouridx);
+            int x_coord_max = (_width + brightness_in_x_pixels + 1) >> 1;
+            int x_coord_min = (_width - brightness_in_x_pixels + 0) >> 1;
+            int x_coord = _width;
+            do {
+                --x_coord;
+                if (x_coord >= x_coord_min && x_coord < x_coord_max) {
+                    row[ESP32_TX_FIFO_POSITION_ADJUST(x_coord)] &= BITMASK_OE_CLEAR;
+                } else {
+                    row[ESP32_TX_FIFO_POSITION_ADJUST(x_coord)] |= BIT_OE;
+                }
+            } while (x_coord);
+        } while (colouridx);
 
 #if defined(SPIRAM_DMA_BUFFER)
-	// Force the flush and update of the PSRAM for the memory address range of the 'row data' as
-	// data changes probably aren't being sent out via DMA as they're sitting in a hadrware 'cache' 
-    ESP32_I2S_DMA_STORAGE_TYPE *row_ptr = fb->rowBits[row_idx]->getDataPtr(0);
-    Cache_WriteBack_Addr((uint32_t)row_ptr, fb->rowBits[row_idx]->getColorDepthSize(false));
+        ESP32_I2S_DMA_STORAGE_TYPE *row_ptr = fb->rowBits[row_idx]->getDataPtr(0);
+        Cache_WriteBack_Addr((uint32_t)row_ptr, fb->rowBits[row_idx]->getColorDepthSize(false));
 #endif
-  } while (row_idx);
+    } while (row_idx);
 }
 
 
