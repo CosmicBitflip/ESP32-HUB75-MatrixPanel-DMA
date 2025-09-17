@@ -300,8 +300,9 @@ struct HUB75_I2S_CFG
   // Matrix driver chip type - default is a plain shift register
   shift_driver driver;
   line_driver line_decoder;
-
-  bool single_scan = false; //single scan addition
+  
+  //single scan addition
+  bool single_scan = false;
 
   // use DMA double buffer (twice as much RAM required)
   bool double_buff;
@@ -350,7 +351,7 @@ struct HUB75_I2S_CFG
       uint16_t _min_refresh_rate = 60, 
       uint8_t _pixel_color_depth_bits = PIXEL_COLOR_DEPTH_BITS_DEFAULT,
       bool _single_scan = false) //single scan addition
-      : mx_width(_w), mx_height(_h), chain_length(_chain), gpio(_pinmap), driver(_drv), double_buff(_dbuff), i2sspeed(_i2sspeed), latch_blanking(_latblk), clkphase(_clockphase), min_refresh_rate(_min_refresh_rate), single_scan(_single_scan)
+      : mx_width(_w), mx_height(_h), chain_length(_chain), gpio(_pinmap), driver(_drv), line_decoder(_line_drv), double_buff(_dbuff), i2sspeed(_i2sspeed), latch_blanking(_latblk), clkphase(_clockphase), min_refresh_rate(_min_refresh_rate), single_scan(_single_scan)
   {
     setPixelColorDepthBits(_pixel_color_depth_bits);
   }
@@ -422,7 +423,6 @@ public:
     rgb1_clear_mask = 0b1111111111111000;  // Default RGB1 mask
     rgb2_clear_mask = 0b1111111111000111;  // Default RGB2 mask
     rgb12_clear_mask = 0b1111111111000000; // Default RGB1+RGB2 mask
-    matrix_rows_in_parallel = 2;           // Default to dual-scan
   }
 
   /**
@@ -442,7 +442,6 @@ public:
     rgb1_clear_mask = 0b1111111111111000;  // Default RGB1 mask
     rgb2_clear_mask = 0b1111111111000111;  // Default RGB2 mask
     rgb12_clear_mask = 0b1111111111000000; // Default RGB1+RGB2 mask
-    matrix_rows_in_parallel = 2;           // Default to dual-scan
   }
 
   /* Propagate the DMA pin configuration, allocate DMA buffs and start data output, initially blank */
@@ -469,6 +468,17 @@ public:
     ESP_LOGI("begin()", "Using GPIO %d for LAT_PIN", m_cfg.gpio.lat);
     ESP_LOGI("begin()", "Using GPIO %d for OE_PIN", m_cfg.gpio.oe);
     ESP_LOGI("begin()", "Using GPIO %d for CLK_PIN", m_cfg.gpio.clk);
+
+    if (m_cfg.single_scan) {
+      if (m_cfg.gpio.r2 >= 0 || m_cfg.gpio.g2 >= 0 || m_cfg.gpio.b2 >= 0) {
+        ESP_LOGE("begin()", "R2/G2/B2 must be -1 for single-scan");
+        return false;
+      }
+      if (m_cfg.mx_height > 16 && m_cfg.gpio.e < 0) {
+        ESP_LOGE("begin()", "E_PIN required for single-scan with height >16");
+        return false;
+      }
+    }
 
     // initialize some specific panel drivers
     if (m_cfg.driver)
@@ -734,6 +744,7 @@ public:
       matrix_rows_in_parallel = 2;
       ROWS_PER_FRAME = m_cfg.mx_height / matrix_rows_in_parallel; // Default 16
     }
+    PIXELS_PER_ROW = m_cfg.mx_width * m_cfg.chain_length;
     MASK_OFFSET = 16 - m_cfg.getPixelColorDepthBits();
 
     config_set = true;
@@ -923,9 +934,14 @@ private:
    * they weree const, but this lead to bugs, when the default constructor was called.
    * So now they could be changed, but shouldn't. Maybe put a cpp lock around it, so it can't be changed after initialisation
    */
-  uint16_t PIXELS_PER_ROW = m_cfg.mx_width * m_cfg.chain_length;      // number of pixels in a single row of all chained matrix modules (WIDTH of a combined matrix chain)
-  uint8_t ROWS_PER_FRAME = m_cfg.mx_height / matrix_rows_in_parallel; // RPF - rows per frame, either 16 or 32 depending on matrix module
-  uint8_t MASK_OFFSET = 16 - m_cfg.getPixelColorDepthBits();
+
+  // commented out for better initialization
+  // uint16_t PIXELS_PER_ROW = m_cfg.mx_width * m_cfg.chain_length;      // number of pixels in a single row of all chained matrix modules (WIDTH of a combined matrix chain)
+  // uint8_t ROWS_PER_FRAME = m_cfg.mx_height / matrix_rows_in_parallel; // RPF - rows per frame, either 16 or 32 depending on matrix module
+  // uint8_t MASK_OFFSET = 16 - m_cfg.getPixelColorDepthBits();
+  uint16_t PIXELS_PER_ROW;
+  uint8_t ROWS_PER_FRAME;
+  uint8_t MASK_OFFSET;
 
   // Other private variables
   bool initialized = false;
@@ -945,13 +961,8 @@ private:
 /* 2. functions declared in the header must be marked inline because otherwise, every translation unit which includes the header will contain a definition of the function, and the linker will complain about multiple definitions (a violation of the One Definition Rule). The inline keyword suppresses this, allowing multiple translation units to contain (identical) definitions. */
 
 inline void MatrixPanel_I2S_DMA::initBitmasks() {
-    if (m_cfg.single_scan) {
-        rgb2_clear_mask = 0xFFFF;    // Ignore RGB2
-        rgb12_clear_mask = rgb1_clear_mask; // Use only RGB1
-    } else {
-        rgb2_clear_mask = 0b1111111111000111;  // Restore default RGB2 mask
-        rgb12_clear_mask = 0b1111111111000000; // Restore default RGB1+RGB2 mask
-    }
+  rgb2_clear_mask = 0b1111111111000111;  // Restore default RGB2 mask
+  rgb12_clear_mask = 0b1111111111000000; // Restore default RGB1+RGB2 mask
 }
 
 /**
