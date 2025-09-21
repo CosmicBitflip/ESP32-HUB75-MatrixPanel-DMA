@@ -102,6 +102,9 @@ enum PANEL_CHAIN_TYPE {
  */
 template <PANEL_SCAN_TYPE ScanType>
 struct ScanTypeMapping {
+
+	static constexpr PANEL_SCAN_TYPE kScanType = ScanType;
+
 	static constexpr VirtualCoords apply(VirtualCoords coords, int panel_pixel_base) 
 	{
 		//log_v("ScanTypeMapping: coords.x: %d, coords.y: %d, virt_y: %d, pixel_base: %d", coords.x, coords.y, virt_y, panel_pixel_base);
@@ -164,7 +167,7 @@ struct ScanTypeMapping {
 			coords.y = (coords.y >> 4) * 8 + (coords.y & 0b00000111);
 		}
 		// SINGLE_SCAN_32PX_HIGH
-        if constexpr (ScanType == SINGLE_SCAN_32PX_HIGH) {
+        else if constexpr (ScanType == SINGLE_SCAN_32PX_HIGH) {
             // Direct mapping for 1/32 scan, single RGB, 32 rows addressed via A-E
             coords.y = coords.y % 32; // Ensure y is 0-31
             return coords;
@@ -231,17 +234,6 @@ public:
 	{
 		// Initialize with an invalid coordinate.
 		coords.x = coords.y = -1;
-	}
-
-	// Validate single-scan mode at compile time
-	if constexpr (ScanTypeMapping::ScanType == SINGLE_SCAN_32PX_HIGH) {
-		if (_panel_res_y != 32) {
-			ESP_LOGE("VirtualMatrixPanel_T", "SINGLE_SCAN_32PX_HIGH requires panel height of 32");
-		}
-		const HUB75_I2S_CFG &cfg = display->getCfg(); // Assume display is set via setDisplay
-		if (!cfg.single_scan || cfg.gpio.e == -1) {
-			ESP_LOGE("VirtualMatrixPanel_T", "SINGLE_SCAN_32PX_HIGH requires single_scan=true and E pin");
-		}
 	}
 
 	// ------------------------------------------------------------------
@@ -514,6 +506,16 @@ public:
 
 	inline void setDisplay(MatrixPanel_I2S_DMA &disp) {
 		display = &disp;
+		// Validate single-scan mode at compile time
+		if constexpr (ScanTypeMapping::kScanType == SINGLE_SCAN_32PX_HIGH) {
+			if (panel_res_y != 32) {
+				Serial.println("SINGLE_SCAN_32PX_HIGH requires panel height of 32");
+			}
+			const HUB75_I2S_CFG &cfg = display->getCfg();
+			if (!cfg.single_scan || cfg.gpio.e == -1) {
+				Serial.println("SINGLE_SCAN_32PX_HIGH requires single_scan=true and E pin");
+			}
+		}
 	}
 
 private:
