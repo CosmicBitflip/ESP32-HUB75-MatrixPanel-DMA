@@ -30,50 +30,71 @@
 
 
 
-  /* LED Brightness Compensation */
+  /* LED Brightness Compensation
+ *
+ * The cie_luts.h header selects lumConvTab at *compile* time based on
+ * PIXEL_COLOR_DEPTH_BITS.  The BCM loop uses m_cfg.getPixelColorDepthBits()
+ * at *runtime*.  If the user sets a non-default depth without defining
+ * PIXEL_COLOR_DEPTH_BITS as a build flag (e.g. runtime depth 6 but no
+ * -DPIXEL_COLOR_DEPTH_BITS=6), the compile-time alias defaults to the
+ * 8-bit table while the loop only tests bits 0-5 — giving completely wrong
+ * CIE correction.
+ *
+ * Fix: when PIXEL_COLOR_DEPTH_BITS is NOT defined at compile time, all five
+ * native LUT tables plus the 12-bit fallback are compiled in (see cie_luts.h
+ * include guards).  Dispatch to the correct table at runtime via a small
+ * helper.  When PIXEL_COLOR_DEPTH_BITS IS defined, the matching table is the
+ * only one compiled in and the runtime default equals the compile-time value,
+ * so the lumConvTab alias is safe to use directly.
+ */
 #ifndef NO_CIE1931
-  /* CIE 1931 correction with bit-depth-optimized LUTs */
-  #ifdef LUT_NATIVE_BIT_DEPTH
-    // Optimized path: LUT maps 8-bit input (0-255) directly to target bit depth output
-    #define DO_BRIGHTNESS_COMPENSATION()  \
-      auto red_val   = lumConvTab[red];   \
-      auto green_val = lumConvTab[green]; \
-      auto blue_val  = lumConvTab[blue];
-  #else
-    // Fallback for non-standard bit depths: 12-bit LUT with shift+round to target depth
-    #define DO_BRIGHTNESS_COMPENSATION()                                   \
-      uint16_t red16   = lumConvTab[red];                                  \
-      uint16_t green16 = lumConvTab[green];                                \
-      uint16_t blue16  = lumConvTab[blue];                                 \
-                                                                           \
-      uint8_t shift_amount = 12 - m_cfg.getPixelColorDepthBits();         \
-      uint16_t rounding = 1 << (shift_amount - 1);                        \
-      uint16_t max_val = (1 << m_cfg.getPixelColorDepthBits()) - 1;       \
-      auto red_val   = (red16 + rounding) >> shift_amount;                \
-      auto green_val = (green16 + rounding) >> shift_amount;              \
-      auto blue_val  = (blue16 + rounding) >> shift_amount;               \
-                                                                           \
-      red_val   = red_val   > max_val ? max_val : red_val;                \
-      green_val = green_val > max_val ? max_val : green_val;              \
-      blue_val  = blue_val  > max_val ? max_val : blue_val;
-  #endif
+
+#ifndef PIXEL_COLOR_DEPTH_BITS
+  // All LUT tables are compiled in — pick the right one at runtime.
+  static inline uint16_t _cie_correct(uint8_t v, uint8_t depth)
+  {
+    switch (depth) {
+      case  4: return lumConvTab_4bit[v];
+      case  6: return lumConvTab_6bit[v];
+      case  7: return lumConvTab_7bit[v];
+      case  8: return lumConvTab_8bit[v];
+      case 10: return lumConvTab_10bit[v];
+      default: {
+        // 12-bit LUT with shift+round for non-native depths
+        if (depth >= 12) return lumConvTab_12bit[v];
+        const uint8_t  sh  = 12u - depth;
+        const uint16_t rnd = 1u << (sh - 1u);
+        const uint16_t mx  = (1u << depth) - 1u;
+        uint16_t r = (lumConvTab_12bit[v] + rnd) >> sh;
+        return (r > mx) ? mx : r;
+      }
+    }
+  }
+  #define DO_BRIGHTNESS_COMPENSATION()                                   \
+    const uint8_t  _cdepth = m_cfg.getPixelColorDepthBits();            \
+    uint16_t red_val   = _cie_correct(red,   _cdepth);                  \
+    uint16_t green_val = _cie_correct(green, _cdepth);                  \
+    uint16_t blue_val  = _cie_correct(blue,  _cdepth);
 #else
-  // NO_CIE1931: linear scaling with rounding to target bit depth
-  #define DO_BRIGHTNESS_COMPENSATION()                                     \
-    uint16_t red16   = red   * 256u;                                       \
-    uint16_t green16 = green * 256u;                                       \
-    uint16_t blue16  = blue  * 256u;                                       \
-                                                                           \
-    uint8_t shift_amount = 16 - m_cfg.getPixelColorDepthBits();           \
-    uint16_t rounding = (1 << (shift_amount - 1)) - 1;                    \
-    uint16_t max_val = (1 << m_cfg.getPixelColorDepthBits()) - 1;         \
-    uint16_t red_val   = (red16   + rounding) >> shift_amount;            \
-    uint16_t green_val = (green16 + rounding) >> shift_amount;            \
-    uint16_t blue_val  = (blue16  + rounding) >> shift_amount;            \
-    red_val   = red_val   > max_val ? max_val : red_val;                  \
-    green_val = green_val > max_val ? max_val : green_val;                \
-    blue_val  = blue_val  > max_val ? max_val : blue_val;
+  // PIXEL_COLOR_DEPTH_BITS is fixed at compile time: lumConvTab is the
+  // correct native table and the runtime depth defaults to match it.
+  #define DO_BRIGHTNESS_COMPENSATION()          \
+    uint16_t red_val   = lumConvTab[red];       \
+    uint16_t green_val = lumConvTab[green];     \
+    uint16_t blue_val  = lumConvTab[blue];
 #endif
+
+#else // NO_CIE1931
+
+  // Linear scaling: map 8-bit input to the runtime bit-depth range with rounding.
+  #define DO_BRIGHTNESS_COMPENSATION()                                     \
+    const uint8_t  _cdepth = m_cfg.getPixelColorDepthBits();              \
+    const uint16_t _cmax   = (1u << _cdepth) - 1u;                       \
+    uint16_t red_val   = ((uint16_t)red   * _cmax + 127u) / 255u;        \
+    uint16_t green_val = ((uint16_t)green * _cmax + 127u) / 255u;        \
+    uint16_t blue_val  = ((uint16_t)blue  * _cmax + 127u) / 255u;
+
+#endif // NO_CIE1931
 
 
 
