@@ -30,54 +30,24 @@
 
 
 
-  /* LED Brightness Compensation */                                                               
-#ifndef NO_CIE1931                                                                                
-  /* CIE 1931 correction with bit-depth-optimized LUTs*/                                            
-  #ifdef LUT_NATIVE_BIT_DEPTH
-
-
-    // Optimized path: LUT maps 8-bit input (0-255) directly to target bit depth output
-    #define DO_BRIGHTNESS_COMPENSATION()                                                              \
-      auto red_val   = lumConvTab[red];                                                               \
-      auto green_val = lumConvTab[green];                                                             \
-      auto blue_val  = lumConvTab[blue];                                                              
-
-
-  #else
-    // Fallback for non-standard bit depths: 12-bit LUT with shift+round to target depth
-
-    #define DO_BRIGHTNESS_COMPENSATION()                                                              \
-      uint16_t red16   = lumConvTab[red];                                                             \
-      uint16_t green16 = lumConvTab[green];                                                           \
-      uint16_t blue16  = lumConvTab[blue];                                                            \
-                                                                                                      \
-      uint8_t shift_amount = 12 - m_cfg.getPixelColorDepthBits();                                     \
-      uint16_t rounding = 1 << (shift_amount - 1);                                                    \
-      uint16_t max_val = (1 << m_cfg.getPixelColorDepthBits()) -1;                                    \
-      auto red_val   = (red16 + rounding) >> shift_amount;                                            \
-      auto green_val = (green16 + rounding) >> shift_amount;                                          \
-      auto blue_val  = (blue16 + rounding) >> shift_amount;                                           \
-                                                                                                      \
-      red_val = red_val > max_val ? max_val : red_val;                                                \
-      green_val = green_val > max_val ? max_val : green_val;                                          \
-      blue_val = blue_val > max_val ? max_val : blue_val;  
-  #endif
+  /* LED Brightness Compensation
+ * Loads the CIE 1931-corrected 16-bit value for each channel.
+ * BCM bit-extraction uses PIXEL_COLOR_MASK_BIT(idx, MASK_OFFSET) which tests
+ * bits [MASK_OFFSET .. MASK_OFFSET+depth-1] of these 16-bit values, matching
+ * exactly what the 16-bit lumConvTab was designed for.
+ */
+#ifndef NO_CIE1931
+  #define DO_BRIGHTNESS_COMPENSATION()    \
+    uint16_t red16   = lumConvTab[red];   \
+    uint16_t green16 = lumConvTab[green]; \
+    uint16_t blue16  = lumConvTab[blue];
 #else
-  // NO_CIE1931: linear scaling with rounding
-  #define DO_BRIGHTNESS_COMPENSATION()                                                               \
-    uint16_t red16   = red * 256u;                                                                   \
-    uint16_t green16 = green * 256u;                                                                 \
-    uint16_t blue16  = blue * 256u;                                                                  \
-                                                                                                     \
-    uint8_t shift_amount = 16 - m_cfg.getPixelColorDepthBits();                                      \
-    uint16_t rounding = (1 << (shift_amount - 1))-1;                                                 \
-    uint16_t max_val = (1 << m_cfg.getPixelColorDepthBits()) -1;                                     \
-    uint16_t red_val   = (red16 + rounding) >> shift_amount;                                         \
-    uint16_t green_val = (green16 + rounding) >> shift_amount;                                       \
-    uint16_t blue_val  = (blue16 + rounding) >> shift_amount;                                        \
-    red_val = red_val > max_val ? max_val : red_val;                                                 \
-    green_val = green_val > max_val ? max_val : green_val;                                           \
-    blue_val = blue_val > max_val ? max_val : blue_val;                                              
+  // NO_CIE1931: shift 8-bit input up to the MSB region of a 16-bit word so that
+  // PIXEL_COLOR_MASK_BIT with MASK_OFFSET selects the correct bits.
+  #define DO_BRIGHTNESS_COMPENSATION()         \
+    uint16_t red16   = red   << MASK_OFFSET;   \
+    uint16_t green16 = green << MASK_OFFSET;   \
+    uint16_t blue16  = blue  << MASK_OFFSET;
 #endif
 
 
@@ -443,17 +413,18 @@ void IRAM_ATTR MatrixPanel_I2S_DMA::updateMatrixDMABuffer(uint16_t x_coord, uint
   {
     --colour_depth_idx;
 
-    // Extract bit at current depth index
-    uint16_t mask = (1 << colour_depth_idx);
+    // Extract the BCM bit for this depth plane using the 16-bit LUT representation.
+    // MASK_OFFSET shifts the active bits to align with the 16-bit lumConvTab range.
+    uint16_t mask = PIXEL_COLOR_MASK_BIT(colour_depth_idx, MASK_OFFSET);
     uint16_t RGB_output_bits = 0;
 
     /* Per the .h file, the order of the output RGB bits is:
      * BIT_B2, BIT_G2, BIT_R2,    BIT_B1, BIT_G1, BIT_R1     */
-    RGB_output_bits |= (bool)(blue_val & mask); // --B
+    RGB_output_bits |= (bool)(blue16 & mask); // --B
     RGB_output_bits <<= 1;
-    RGB_output_bits |= (bool)(green_val & mask); // -BG
+    RGB_output_bits |= (bool)(green16 & mask); // -BG
     RGB_output_bits <<= 1;
-    RGB_output_bits |= (bool)(red_val & mask); // BGR
+    RGB_output_bits |= (bool)(red16 & mask); // BGR
     RGB_output_bits <<= _colourbitoffset;    // shift colour bits to the required position
 
     // Get the contents at this address,
@@ -486,16 +457,16 @@ void MatrixPanel_I2S_DMA::updateMatrixDMABuffer(uint8_t red, uint8_t green, uint
     // let's precalculate RGB1 and RGB2 bits than flood it over the entire DMA buffer
     uint16_t RGB_output_bits = 0;
 
-    // Extract bit at current depth index
-    uint16_t mask = (1 << colour_depth_idx);
+    // Extract the BCM bit for this depth plane using the 16-bit LUT representation.
+    uint16_t mask = PIXEL_COLOR_MASK_BIT(colour_depth_idx, MASK_OFFSET);
 
     /* Per the .h file, the order of the output RGB bits is:
      * BIT_B2, BIT_G2, BIT_R2,    BIT_B1, BIT_G1, BIT_R1      */
-    RGB_output_bits |= (bool)(blue_val & mask); // --B
+    RGB_output_bits |= (bool)(blue16 & mask); // --B
     RGB_output_bits <<= 1;
-    RGB_output_bits |= (bool)(green_val & mask); // -BG
+    RGB_output_bits |= (bool)(green16 & mask); // -BG
     RGB_output_bits <<= 1;
-    RGB_output_bits |= (bool)(red_val & mask); // BGR
+    RGB_output_bits |= (bool)(red16 & mask); // BGR
 
     // Duplicate and shift across so we have have 6 populated bits of RGB1 and RGB2 pin values suitable for DMA buffer
     if (!m_cfg.single_scan) {
@@ -870,16 +841,16 @@ DO_BRIGHTNESS_COMPENSATION()
     // let's precalculate RGB1 and RGB2 bits than flood it over the entire DMA buffer
     uint16_t RGB_output_bits = 0;
 
-    // Extract bit at current depth index
-    uint16_t mask = (1 << colour_depth_idx);
+    // Extract the BCM bit for this depth plane using the 16-bit LUT representation.
+    uint16_t mask = PIXEL_COLOR_MASK_BIT(colour_depth_idx, MASK_OFFSET);
 
     /* Per the .h file, the order of the output RGB bits is:
      * BIT_B2, BIT_G2, BIT_R2,    BIT_B1, BIT_G1, BIT_R1     */
-    RGB_output_bits |= (bool)(blue_val & mask); // --B
+    RGB_output_bits |= (bool)(blue16 & mask); // --B
     RGB_output_bits <<= 1;
-    RGB_output_bits |= (bool)(green_val & mask); // -BG
+    RGB_output_bits |= (bool)(green16 & mask); // -BG
     RGB_output_bits <<= 1;
-    RGB_output_bits |= (bool)(red_val & mask); // BGR
+    RGB_output_bits |= (bool)(red16 & mask); // BGR
     RGB_output_bits <<= _colourbitoffset;    // shift color bits to the required position
 
     // Get the contents at this address,
@@ -948,17 +919,17 @@ void MatrixPanel_I2S_DMA::vlineDMA(int16_t x_coord, int16_t y_coord, int16_t l, 
   { // Iterating through colour depth bits (8 iterations)
     --colour_depth_idx;
 
-    // Extract bit at current depth index
-    uint16_t mask = (1 << colour_depth_idx);
+    // Extract the BCM bit for this depth plane using the 16-bit LUT representation.
+    uint16_t mask = PIXEL_COLOR_MASK_BIT(colour_depth_idx, MASK_OFFSET);
     uint16_t RGB_output_bits = 0;
 
     /* Per the .h file, the order of the output RGB bits is:
      * BIT_B2, BIT_G2, BIT_R2,    BIT_B1, BIT_G1, BIT_R1   */
-    RGB_output_bits |= (bool)(blue_val & mask); // --B
+    RGB_output_bits |= (bool)(blue16 & mask); // --B
     RGB_output_bits <<= 1;
-    RGB_output_bits |= (bool)(green_val & mask); // -BG
+    RGB_output_bits |= (bool)(green16 & mask); // -BG
     RGB_output_bits <<= 1;
-    RGB_output_bits |= (bool)(red_val & mask); // BGR
+    RGB_output_bits |= (bool)(red16 & mask); // BGR
 
     int16_t _l = 0, _y = y_coord;
     uint16_t _colourbitclear = BITMASK_RGB1_CLEAR;
