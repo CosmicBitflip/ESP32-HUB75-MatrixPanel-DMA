@@ -166,7 +166,15 @@ bool MatrixPanel_I2S_DMA::setupDMA(const HUB75_I2S_CFG &_cfg)
 
     ESP_LOGW("I2S-DMA", "lsbMsbTransitionBit of %d gives %d Hz refresh rate.", lsbMsbTransitionBit, actualRefreshRate);
 
-    if (actualRefreshRate >= m_cfg.min_refresh_rate)
+    // For single-scan panels ROWS_PER_FRAME is doubled compared to dual-scan, so with a
+    // 60 Hz min_refresh_rate target the loop would push lsbMsbTransitionBit from 1 to 2.
+    // With lsbMsbTransitionBit=2 bits 0/1/2 all get equal BCM weight, producing non-monotonic
+    // brightness (value 63 is brighter than 64, 127 brighter than 128) — visible as dark bands
+    // in any gradient.  Comparing against the dual-scan-equivalent frame rate keeps
+    // lsbMsbTransitionBit at 1 (same as a dual-scan panel), accepting ~half the refresh rate
+    // (e.g. ~55 Hz instead of ~110 Hz for a 64 px panel at 8 MHz) which is still visually fine.
+    int refreshRateCheck = m_cfg.single_scan ? actualRefreshRate * MATRIX_ROWS_IN_PARALLEL : actualRefreshRate;
+    if (refreshRateCheck >= m_cfg.min_refresh_rate)
       break;
 
     if (lsbMsbTransitionBit < m_cfg.getPixelColorDepthBits() - 1)
@@ -177,7 +185,7 @@ bool MatrixPanel_I2S_DMA::setupDMA(const HUB75_I2S_CFG &_cfg)
 
   if (lsbMsbTransitionBit > 0)
   {
-    ESP_LOGW("I2S-DMA", "lsbMsbTransitionBit of %d used to achieve refresh rate of %d Hz. Percieved colour depth to the eye may be reduced.", lsbMsbTransitionBit, m_cfg.min_refresh_rate);
+    ESP_LOGW("I2S-DMA", "lsbMsbTransitionBit of %d used. Actual refresh rate: %d Hz. Perceived colour depth to the eye may be reduced.", lsbMsbTransitionBit, calculated_refresh_rate);
   }
 
   ESP_LOGI("I2S-DMA", "DMA frame buffer color depths: %d", m_cfg.getPixelColorDepthBits());
