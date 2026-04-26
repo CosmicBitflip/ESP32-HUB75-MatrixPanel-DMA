@@ -69,6 +69,7 @@ enum PANEL_SCAN_TYPE {
 	FOUR_SCAN_40PX_HIGH,			///< Four-scan mode, 40-pixel high panels.	
 	FOUR_SCAN_40_80PX_HFARCAN,		///< Four-scan mode, 40-pixel high, 80px wide panel. Weird mapping: https://github.com/mrcodetastic/ESP32-HUB75-MatrixPanel-DMA/issues/759
 	FOUR_SCAN_64PX_HIGH,			///< Four-scan mode, 64-pixel high panels.
+	SINGLE_SCAN_32PX_HIGH,			///< Single-scan mode, 32-pixel high panels driven via one RGB channel pair (1/32 scan).
 };
 
 /**
@@ -101,6 +102,8 @@ enum PANEL_CHAIN_TYPE {
  */
 template <PANEL_SCAN_TYPE ScanType>
 struct ScanTypeMapping {
+	static constexpr PANEL_SCAN_TYPE kScanType = ScanType;
+
 	static constexpr VirtualCoords apply(VirtualCoords coords, int panel_pixel_base) 
 	{
 		//log_v("ScanTypeMapping: coords.x: %d, coords.y: %d, virt_y: %d, pixel_base: %d", coords.x, coords.y, virt_y, panel_pixel_base);
@@ -161,6 +164,11 @@ struct ScanTypeMapping {
 			}
 			
 			coords.y = (coords.y >> 4) * 8 + (coords.y & 0b00000111);
+		}
+		// SINGLE_SCAN_32PX_HIGH: rows are addressed sequentially (no coordinate remapping needed)
+		else if constexpr (ScanType == SINGLE_SCAN_32PX_HIGH)
+		{
+			coords.y = coords.y % 32;
 		}
 
 		// For STANDARD_TWO_SCAN / NORMAL_ONE_SIXTEEN no remapping is done.
@@ -492,6 +500,18 @@ public:
 
 	inline void setDisplay(MatrixPanel_I2S_DMA &disp) {
 		display = &disp;
+		if constexpr (ScanTypeMapping::kScanType == SINGLE_SCAN_32PX_HIGH) {
+			if (panel_res_y != 32) {
+				ESP_LOGW("VirtualMatrixPanel_T", "SINGLE_SCAN_32PX_HIGH requires panel height of 32 (got %d).", panel_res_y);
+			}
+			const HUB75_I2S_CFG &cfg = display->getCfg();
+			if (!cfg.single_scan) {
+				ESP_LOGW("VirtualMatrixPanel_T", "SINGLE_SCAN_32PX_HIGH requires single_scan=true in HUB75_I2S_CFG.");
+			}
+			if (cfg.mx_height > 16 && cfg.gpio.e < 0) {
+				ESP_LOGW("VirtualMatrixPanel_T", "SINGLE_SCAN_32PX_HIGH requires E pin for panels taller than 16 rows.");
+			}
+		}
 	}
 
 private:

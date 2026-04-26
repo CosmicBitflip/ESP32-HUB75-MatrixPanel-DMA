@@ -490,7 +490,9 @@ void MatrixPanel_I2S_DMA::updateMatrixDMABuffer(uint8_t red, uint8_t green, uint
     RGB_output_bits |= (bool)(red_val & mask); // BGR
 
     // Duplicate and shift across so we have have 6 populated bits of RGB1 and RGB2 pin values suitable for DMA buffer
-    RGB_output_bits |= RGB_output_bits << BITS_RGB2_OFFSET; // BGRBGR
+    if (!m_cfg.single_scan) {
+      RGB_output_bits |= RGB_output_bits << BITS_RGB2_OFFSET; // BGRBGR
+    }
 
     // Serial.printf("Fill with: 0x%#06x\n", RGB_output_bits);
 
