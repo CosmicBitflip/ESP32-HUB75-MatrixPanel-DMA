@@ -315,6 +315,10 @@ struct HUB75_I2S_CFG
   // Set this to '1' to get all colour depths displayed with correct BCM time weighting.
   uint8_t min_refresh_rate;
 
+  // When true, drives every row individually via a single RGB channel pair (1/N-scan).
+  // R2/G2/B2 pins must be set to -1. Panels taller than 16 rows require the E address pin.
+  bool single_scan;
+
   // struct constructor
   HUB75_I2S_CFG(
       uint16_t _w = MATRIX_WIDTH,
@@ -331,8 +335,9 @@ struct HUB75_I2S_CFG
       uint8_t _latblk = DEFAULT_LAT_BLANKING, // Anything > 1 seems to cause artefacts on ICS panels
       bool _clockphase = true, 
       uint16_t _min_refresh_rate = 60, 
-      uint8_t _pixel_color_depth_bits = PIXEL_COLOR_DEPTH_BITS_DEFAULT) 
-      : mx_width(_w), mx_height(_h), chain_length(_chain), gpio(_pinmap), driver(_drv), double_buff(_dbuff), i2sspeed(_i2sspeed), latch_blanking(_latblk), clkphase(_clockphase), min_refresh_rate(_min_refresh_rate)
+      uint8_t _pixel_color_depth_bits = PIXEL_COLOR_DEPTH_BITS_DEFAULT,
+      bool _single_scan = false) 
+      : mx_width(_w), mx_height(_h), chain_length(_chain), gpio(_pinmap), driver(_drv), line_decoder(_line_drv), double_buff(_dbuff), i2sspeed(_i2sspeed), latch_blanking(_latblk), clkphase(_clockphase), min_refresh_rate(_min_refresh_rate), single_scan(_single_scan)
   {
     setPixelColorDepthBits(_pixel_color_depth_bits);
   }
@@ -452,11 +457,22 @@ public:
 #endif
 	
     ESP_LOGI("begin()", "HUB75 effective display resolution of width: %dpx height: %dpx.", m_cfg.mx_width * m_cfg.chain_length, m_cfg.mx_height);
-	
-	if (m_cfg.mx_height % 2 != 0) {
-		ESP_LOGE("begin()", "Error: m_cfg.mx_height must be an even number!");
-		return false;
-	}
+
+    if (m_cfg.single_scan) {
+      if (m_cfg.gpio.r2 >= 0 || m_cfg.gpio.g2 >= 0 || m_cfg.gpio.b2 >= 0) {
+        ESP_LOGE("begin()", "single_scan: R2/G2/B2 pins must be set to -1 (unused).");
+        return false;
+      }
+      if (m_cfg.mx_height > 16 && m_cfg.gpio.e < 0) {
+        ESP_LOGE("begin()", "single_scan: E pin required for panels taller than 16 rows.");
+        return false;
+      }
+    } else {
+      if (m_cfg.mx_height % 2 != 0) {
+        ESP_LOGE("begin()", "Error: m_cfg.mx_height must be an even number!");
+        return false;
+      }
+    }
 
     /* As DMA buffers are dynamically allocated, we must allocated in begin()
      * Ref: https://github.com/espressif/arduino-esp32/issues/831
@@ -694,7 +710,7 @@ public:
 
     m_cfg = cfg;
     PIXELS_PER_ROW = m_cfg.mx_width * m_cfg.chain_length;
-    ROWS_PER_FRAME = m_cfg.mx_height / MATRIX_ROWS_IN_PARALLEL;
+    ROWS_PER_FRAME = m_cfg.single_scan ? m_cfg.mx_height : m_cfg.mx_height / MATRIX_ROWS_IN_PARALLEL;
     MASK_OFFSET = 16 - m_cfg.getPixelColorDepthBits();
 
     config_set = true;
