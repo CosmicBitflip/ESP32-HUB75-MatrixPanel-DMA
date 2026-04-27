@@ -76,16 +76,33 @@
     uint16_t green_val = _cie_correct(green, _cdepth);                  \
     uint16_t blue_val  = _cie_correct(blue,  _cdepth);
 #else
-  // PIXEL_COLOR_DEPTH_BITS is fixed at compile time.
-  // lumConvTab and LUT_NATIVE_BIT_DEPTH are defined by cie_luts.h.
-  #if LUT_NATIVE_BIT_DEPTH
+  // PIXEL_COLOR_DEPTH_BITS is fixed at compile time — select the right LUT alias here.
+  #if   PIXEL_COLOR_DEPTH_BITS == 4
+    #define lumConvTab lumConvTab_4bit
+  #elif PIXEL_COLOR_DEPTH_BITS == 6
+    #define lumConvTab lumConvTab_6bit
+  #elif PIXEL_COLOR_DEPTH_BITS == 7
+    #define lumConvTab lumConvTab_7bit
+  #elif PIXEL_COLOR_DEPTH_BITS == 8
+    #define lumConvTab lumConvTab_8bit
+  #elif PIXEL_COLOR_DEPTH_BITS == 10
+    #define lumConvTab lumConvTab_10bit
+  #else
+    // 12-bit, or any non-native depth (e.g. 5, 9, 11): use 12-bit table and shift.
+    #define lumConvTab lumConvTab_12bit
+  #endif
+
+  #if PIXEL_COLOR_DEPTH_BITS == 4  || PIXEL_COLOR_DEPTH_BITS == 6  || \
+      PIXEL_COLOR_DEPTH_BITS == 7  || PIXEL_COLOR_DEPTH_BITS == 8  || \
+      PIXEL_COLOR_DEPTH_BITS == 10 || PIXEL_COLOR_DEPTH_BITS == 12
     // Native table: output values are already in the correct bit-depth range.
     #define DO_BRIGHTNESS_COMPENSATION()          \
       uint16_t red_val   = lumConvTab[red];       \
       uint16_t green_val = lumConvTab[green];     \
       uint16_t blue_val  = lumConvTab[blue];
   #else
-    // Non-native compile-time depth (e.g. 9, 11): shift from 12-bit LUT.
+    // Non-native compile-time depth (e.g. 5, 9, 11): shift-and-round from 12-bit LUT.
+    #warning "PIXEL_COLOR_DEPTH_BITS is set to a non-native depth — using 12-bit LUT with shift"
     #define DO_BRIGHTNESS_COMPENSATION()                                         \
       constexpr uint8_t  _sh  = 12u - PIXEL_COLOR_DEPTH_BITS;                  \
       constexpr uint16_t _rnd = 1u << (_sh - 1u);                              \
